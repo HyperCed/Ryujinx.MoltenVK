@@ -2143,6 +2143,7 @@ MVKArrayRef<MVKQueueFamily*> MVKPhysicalDevice::getQueueFamilies() {
 
 		// General-purpose queue family
 		qfProps.queueFlags = (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT);
+		if (getSparseHeapSize()) { qfProps.queueFlags |= VK_QUEUE_SPARSE_BINDING_BIT; }
 		_queueFamilies.push_back(new MVKQueueFamily(this, qfIdx++, &qfProps));
 
 		// Single queue semaphore requires using a single queue for everything
@@ -2677,8 +2678,24 @@ bool MVKPhysicalDevice::isTier2MetalArgumentBuffers() {
 }
 
 // Initializes the physical device features of this instance.
+VkDeviceSize MVKPhysicalDevice::getSparseHeapSize() {
+	static const VkDeviceSize heapSize = []() -> VkDeviceSize {
+		const char* val = getenv("MVK_CONFIG_SPARSE_HEAP_SIZE_MB");
+		return (val ? strtoull(val, nullptr, 10) : 2048) << 20;
+	}();
+	// Sparse textures need an Apple GPU, and the 64 KiB tiles need macOS 13.
+	if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
+		if (_gpuCapabilities.isAppleGPU && supportsMTLGPUFamily(Apple6)) { return heapSize; }
+	}
+	return 0;
+}
+
 void MVKPhysicalDevice::initFeatures() {
 	mvkClear(&_features);	// Start with everything cleared
+
+	// Images only: Metal has no sparse buffers, and its tiles can't share memory.
+	_features.sparseBinding = getSparseHeapSize() != 0;
+	_features.sparseResidencyImage2D = _features.sparseBinding;
 
     _features.robustBufferAccess = true; // NOTE: Required by spec, not fully supported by non-Apple GPUs.
     _features.fullDrawIndexUint32 = true;
@@ -3028,7 +3045,9 @@ void MVKPhysicalDevice::initLimits() {
 
     // Unsupported features - set to zeros generally
 
-    _properties.limits.sparseAddressSpaceSize = 0;
+    _properties.limits.sparseAddressSpaceSize = getSparseHeapSize() ? (1ull << 40) : 0;
+    _properties.sparseProperties.residencyStandard2DBlockShape = getSparseHeapSize() != 0;
+    _properties.sparseProperties.residencyNonResidentStrict = getSparseHeapSize() != 0;
 
     _properties.limits.maxGeometryShaderInvocations = 0;
     _properties.limits.maxGeometryInputComponents = 0;
@@ -5314,7 +5333,45 @@ void MVKDevice::reservePrivateData(const VkDeviceCreateInfo* pCreateInfo) {
 	}
 }
 
+MVKSparseHeap* MVKDevice::getSparseHeap() {
+	VkDeviceSize heapSize = _physicalDevice->getSparseHeapSize();
+	if ( !heapSize ) { return nullptr; }
+
+	lock_guard<mutex> lock(_rezLock);
+	// An image takes its tiles from the heap it was created in: start another once this one is
+	// mostly mapped. Metal commits a heap whole when one of its images is first used, so images
+	// don't get heaps of their own.
+	if ( !_sparseHeaps.empty() && _sparseHeaps.back()->mappedBytes.load() < heapSize / 4 * 3 ) {
+		return _sparseHeaps.back();
+	}
+	MVKSparseHeap* heap = nullptr;
+	if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
+		MTLHeapDescriptor* heapDesc = [MTLHeapDescriptor new];	// temp retain
+		heapDesc.type = MTLHeapTypeSparse;
+		heapDesc.storageMode = MTLStorageModePrivate;
+		heapDesc.hazardTrackingMode = MTLHazardTrackingModeTracked;
+		heapDesc.sparsePageSize = MTLSparsePageSize64;
+		heapDesc.size = heapSize;
+		id<MTLHeap> mtlHeap = [_physicalDevice->getMTLDevice() newHeapWithDescriptor: heapDesc];	// retained
+		[heapDesc release];											// temp release
+		if (mtlHeap) {
+			heap = new MVKSparseHeap();
+			heap->mtlHeap = mtlHeap;
+			heap->size = heapSize;
+			_sparseHeaps.push_back(heap);
+			MVKLogInfo("Created sparse heap %zu of %llu MB.", _sparseHeaps.size(), heapSize >> 20);
+		}
+	}
+	return heap;
+}
+
 MVKDevice::~MVKDevice() {
+	for (auto* heap : _sparseHeaps) {
+		[heap->mtlHeap release];
+		delete heap;
+	}
+	_sparseHeaps.clear();
+
 	if (_isPerformanceTracking) {
 		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
 		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {

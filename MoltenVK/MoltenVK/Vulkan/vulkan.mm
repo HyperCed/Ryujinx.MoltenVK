@@ -625,11 +625,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetImageSparseMemoryRequirements(
 
 	MVKTraceVulkanCallStart();
 
-	// Metal does not support sparse images.
-	// Vulkan spec: "If the image was not created with VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT then
-	// pSparseMemoryRequirementCount will be set to zero and pSparseMemoryRequirements will not be written to.".
-
-	*pNumRequirements = 0;
+	((MVKImage*)image)->getSparseMemoryRequirements(pNumRequirements, pSparseMemoryRequirements);
 	MVKTraceVulkanCallEnd();
 }
 
@@ -661,7 +657,7 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkQueueBindSparse(
 
 	MVKTraceVulkanCallStart();
 	MVKQueue* mvkQ = MVKQueue::getMVKQueue(queue);
-	VkResult rslt = mvkQ->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueBindSparse(): Sparse binding is not supported.");
+	VkResult rslt = mvkQ->submitSparse(bindInfoCount, pBindInfo, fence);
 	MVKTraceVulkanCallEnd();
 	return rslt;
 }
@@ -2233,11 +2229,14 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetImageSparseMemoryRequirements2(
 
 	MVKTraceVulkanCallStart();
 
-	// Metal does not support sparse images.
-	// Vulkan spec: "If the image was not created with VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT then
-	// pSparseMemoryRequirementCount will be set to zero and pSparseMemoryRequirements will not be written to.".
-
-    *pSparseMemoryRequirementCount = 0;
+	MVKImage* mvkImg = (MVKImage*)pInfo->image;
+	if (pSparseMemoryRequirements) {
+		uint32_t count = std::min(*pSparseMemoryRequirementCount, 1u);
+		mvkImg->getSparseMemoryRequirements(&count, &pSparseMemoryRequirements->memoryRequirements);
+		*pSparseMemoryRequirementCount = count;
+	} else {
+		mvkImg->getSparseMemoryRequirements(pSparseMemoryRequirementCount, nullptr);
+	}
 	MVKTraceVulkanCallEnd();
 }
 

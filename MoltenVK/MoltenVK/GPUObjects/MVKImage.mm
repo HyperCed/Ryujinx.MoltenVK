@@ -55,7 +55,10 @@ id<MTLTexture> MVKImagePlane::getMTLTexture() {
         }
 
         id<MTLTexture> tex;
-        if (_image->_ioSurface) {
+        if (_image->_isSparse) {
+            // The tiles come from the sparse heap as they are mapped (see MVKQueue::submitSparse()).
+            tex = [_image->_sparseHeap->mtlHeap newTextureWithDescriptor: mtlTexDesc];
+        } else if (_image->_ioSurface) {
             tex = [_image->getMTLDevice()
                    newTextureWithDescriptor: mtlTexDesc
                    iosurface: _image->_ioSurface
@@ -1272,6 +1275,17 @@ MVKImage::MVKImage(MVKDevice* device, const VkImageCreateInfo* pCreateInfo) : MV
     }
     _hasExpectedTexelSize = _hasChromaSubsampling || (pixFmts->getBytesPerBlock(_planes[0]->_mtlPixFmt) == pixFmts->getBytesPerBlock(_vkFormat));
 
+	if (mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)) {
+		if (mvkAreAllFlagsEnabled(pCreateInfo->flags, VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) &&
+			!mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_IMAGE_CREATE_SPARSE_ALIASED_BIT) &&
+			getImageType() == VK_IMAGE_TYPE_2D && _samples == VK_SAMPLE_COUNT_1_BIT && planeCount == 1 &&
+			!_isLinear && !_isLinearForAtomics && !getIsDepthStencil()) {
+			initSparse();
+		} else {
+			setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateImage() : Metal supports sparse images only as single-sampled 2D color images with sparse residency and no aliasing."));
+		}
+	}
+
 	if (pExtMemInfo) { initExternalMemory(pExtMemInfo->handleTypes); }
 
 	// Setting Metal objects directly will override Vulkan settings.
@@ -1454,7 +1468,158 @@ void MVKImage::initExternalMemory(VkExternalMemoryHandleTypeFlags handleTypes) {
 	}
 }
 
+#pragma mark Sparse residency
+
+void MVKImage::initSparse() {
+	_sparseHeap = _device->getSparseHeap();
+	if ( !_sparseHeap ) {
+		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateImage() : Sparse images are not supported on this device."));
+		return;
+	}
+	_isSparse = true;
+	if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
+		MTLSize tile = [getMTLDevice() sparseTileSizeWithTextureType: _mtlTextureType
+														 pixelFormat: _planes[0]->_mtlPixFmt
+														 sampleCount: 1
+													  sparsePageSize: MTLSparsePageSize64];
+		_sparseTileExtent = { (uint32_t)tile.width, (uint32_t)tile.height, 1 };
+	}
+	id<MTLTexture> mtlTex = getMTLTexture(0);
+	if ( !mtlTex || !_sparseTileExtent.width || !_sparseTileExtent.height ) {
+		_isSparse = false;
+		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateImage() : Metal can't create this image as a sparse texture."));
+		return;
+	}
+	_sparseTailLevel = std::min((uint32_t)mtlTex.firstMipmapInTail, _mipLevels);
+	_sparseTailBytes = _sparseTailLevel < _mipLevels ? mvkAlignByteCount(mtlTex.tailSizeInBytes, kMVKSparseTileBytes) : 0;
+
+	// The address space the image spans: its tiles, then one mip tail per layer.
+	VkDeviceSize layerBytes = _sparseTailBytes;
+	for (uint32_t mipLvl = 0; mipLvl < _sparseTailLevel; mipLvl++) {
+		VkExtent3D mipExtent = getExtent3D(0, mipLvl);
+		layerBytes += (VkDeviceSize)mvkCeilingDivide(mipExtent.width, _sparseTileExtent.width) *
+					  mvkCeilingDivide(mipExtent.height, _sparseTileExtent.height) * kMVKSparseTileBytes;
+	}
+	_memoryBindings[0]->_byteCount = layerBytes * _arrayLayers;
+	_memoryBindings[0]->_byteAlignment = kMVKSparseTileBytes;
+}
+
+void MVKImage::getSparseMemoryRequirements(uint32_t* pCount, VkSparseImageMemoryRequirements* pReqs) {
+	if ( !_isSparse ) { *pCount = 0; return; }
+	if ( !pReqs ) { *pCount = 1; return; }
+	if (*pCount == 0) { return; }
+	*pCount = 1;
+	pReqs->formatProperties.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	pReqs->formatProperties.imageGranularity = _sparseTileExtent;
+	pReqs->formatProperties.flags = 0;
+	pReqs->imageMipTailFirstLod = _sparseTailLevel;
+	pReqs->imageMipTailSize = _sparseTailBytes;
+	// Each layer's tail is addressed by the layer: see addSparseMappings().
+	pReqs->imageMipTailOffset = 0;
+	pReqs->imageMipTailStride = _sparseTailBytes;
+}
+
+static inline uint64_t mvkSparseTileKey(uint32_t slice, uint32_t level, uint32_t x, uint32_t y) {
+	return ((uint64_t)slice << 44) | ((uint64_t)level << 38) | ((uint64_t)y << 19) | x;
+}
+
+// Updates the record of mapped tiles and the heap's use with newMappings, then queues them.
+VkResult MVKImage::commitSparseMappings(MVKSmallVector<MVKSparseMapping, 16>& newMappings,
+										MVKSmallVector<MVKSparseMapping, 16>& mappings) {
+	lock_guard<mutex> lock(_lock);
+
+	// Count first, so that nothing changes when the heap is too small.
+	VkDeviceSize mapBytes = 0, unmapBytes = 0;
+	std::unordered_set<uint64_t> seen;
+	for (auto& m : newMappings) {
+		VkDeviceSize tileBytes = m.level >= _sparseTailLevel ? _sparseTailBytes : kMVKSparseTileBytes;
+		for (uint32_t y = m.tileY; y < m.tileY + m.tileHeight; y++) {
+			for (uint32_t x = m.tileX; x < m.tileX + m.tileWidth; x++) {
+				uint64_t key = mvkSparseTileKey(m.slice, m.level, x, y);
+				bool isMapped = _sparseMappedTiles.count(key) != 0;
+				if (m.map != isMapped && seen.insert(key).second) { (m.map ? mapBytes : unmapBytes) += tileBytes; }
+			}
+		}
+	}
+	VkDeviceSize mapped = _sparseHeap->mappedBytes.load();
+	if (mapBytes > unmapBytes && mapped + mapBytes - unmapBytes > _sparseHeap->size) {
+		return reportError(VK_ERROR_OUT_OF_DEVICE_MEMORY, "vkQueueBindSparse(): The sparse heap of %llu MB has no room for %llu KB more (%llu MB mapped). Set MVK_CONFIG_SPARSE_HEAP_SIZE_MB to enlarge it.", _sparseHeap->size >> 20, (mapBytes - unmapBytes) >> 10, mapped >> 20);
+	}
+	for (auto& m : newMappings) {
+		for (uint32_t y = m.tileY; y < m.tileY + m.tileHeight; y++) {
+			for (uint32_t x = m.tileX; x < m.tileX + m.tileWidth; x++) {
+				uint64_t key = mvkSparseTileKey(m.slice, m.level, x, y);
+				if (m.map) { _sparseMappedTiles.insert(key); } else { _sparseMappedTiles.erase(key); }
+			}
+		}
+		mappings.push_back(m);
+	}
+	_sparseHeap->mappedBytes += mapBytes;
+	_sparseHeap->mappedBytes -= unmapBytes;
+	return VK_SUCCESS;
+}
+
+VkResult MVKImage::addSparseMappings(uint32_t bindCount, const VkSparseImageMemoryBind* pBinds,
+									 MVKSmallVector<MVKSparseMapping, 16>& mappings) {
+	if ( !_isSparse ) { return reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueBindSparse(): The image was not created with sparse residency."); }
+
+	MVKSmallVector<MVKSparseMapping, 16> newMappings;
+	for (uint32_t i = 0; i < bindCount; i++) {
+		auto& bind = pBinds[i];
+		uint32_t level = bind.subresource.mipLevel;
+		if (level >= _mipLevels || bind.subresource.arrayLayer >= _arrayLayers) { continue; }
+		MVKSparseMapping m;
+		m.image = this;
+		m.level = level;
+		m.slice = bind.subresource.arrayLayer;
+		m.map = bind.memory != VK_NULL_HANDLE;
+		if (level >= _sparseTailLevel) {
+			// Metal maps the levels of the tail together.
+			m.level = _sparseTailLevel;
+			m.tileX = m.tileY = 0;
+			m.tileWidth = m.tileHeight = 1;
+		} else {
+			VkExtent3D mipExtent = getExtent3D(0, level);
+			uint32_t endX = std::min((uint32_t)bind.offset.x + bind.extent.width, mipExtent.width);
+			uint32_t endY = std::min((uint32_t)bind.offset.y + bind.extent.height, mipExtent.height);
+			m.tileX = bind.offset.x / _sparseTileExtent.width;
+			m.tileY = bind.offset.y / _sparseTileExtent.height;
+			m.tileWidth = mvkCeilingDivide(endX, _sparseTileExtent.width) - m.tileX;
+			m.tileHeight = mvkCeilingDivide(endY, _sparseTileExtent.height) - m.tileY;
+		}
+		newMappings.push_back(m);
+	}
+	return commitSparseMappings(newMappings, mappings);
+}
+
+VkResult MVKImage::addSparseMappings(uint32_t bindCount, const VkSparseMemoryBind* pBinds,
+									 MVKSmallVector<MVKSparseMapping, 16>& mappings) {
+	if ( !_isSparse ) { return reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueBindSparse(): The image was not created with sparse residency."); }
+	if ( !_sparseTailBytes ) { return VK_SUCCESS; }
+
+	MVKSmallVector<MVKSparseMapping, 16> newMappings;
+	for (uint32_t i = 0; i < bindCount; i++) {
+		auto& bind = pBinds[i];
+		// Opaque binds address the mip tails, one per layer.
+		uint32_t firstLayer = (uint32_t)(bind.resourceOffset / _sparseTailBytes);
+		uint32_t endLayer = std::min((uint32_t)mvkCeilingDivide(bind.resourceOffset + bind.size, _sparseTailBytes), _arrayLayers);
+		for (uint32_t layer = firstLayer; layer < endLayer; layer++) {
+			MVKSparseMapping m;
+			m.image = this;
+			m.level = _sparseTailLevel;
+			m.slice = layer;
+			m.tileX = m.tileY = 0;
+			m.tileWidth = m.tileHeight = 1;
+			m.map = bind.memory != VK_NULL_HANDLE;
+			newMappings.push_back(m);
+		}
+	}
+	return commitSparseMappings(newMappings, mappings);
+}
+
 MVKImage::~MVKImage() {
+	// Metal returns the tiles of a sparse texture to its heap when the texture goes.
+	if (_sparseHeap) { _sparseHeap->mappedBytes -= std::min<VkDeviceSize>(_sparseHeap->mappedBytes.load(), _sparseMappedTiles.size() * kMVKSparseTileBytes); }
 	mvkDestroyContainerContents(_memoryBindings);
 	mvkDestroyContainerContents(_planes);
     releaseIOSurface();

@@ -30,6 +30,7 @@
 #include <shared_mutex>
 #include <string>
 #include <mutex>
+#include <atomic>
 #include <os/lock.h>
 
 #import <Metal/Metal.h>
@@ -415,6 +416,12 @@ public:
 	/** Returns the underlying Metal device. */
 	id<MTLDevice> getMTLDevice() const { return _mtlDevice; }
 
+	/**
+	 * Size of the Metal sparse heaps that back sparse images, or zero if they are not supported.
+	 * Set by MVK_CONFIG_SPARSE_HEAP_SIZE_MB (default 2048, 0 disables sparse images).
+	 */
+	VkDeviceSize getSparseHeapSize();
+
 	/** Returns the MTLStorageMode that matches the Vulkan memory property flags. */
 	MTLStorageMode getMTLStorageModeFromVkMemoryPropertyFlags(VkMemoryPropertyFlags vkFlags);
 
@@ -565,6 +572,19 @@ private:
 	std::pair<Lock*, bool> isLive_(id object);
 };
 
+/**
+ * A Metal sparse heap, the pool of tiles the sparse images created from it map and unmap.
+ * Metal commits the whole heap when it is first used, whatever is mapped.
+ */
+struct MVKSparseHeap {
+	id<MTLHeap> mtlHeap = nil;
+	VkDeviceSize size = 0;
+	std::atomic<VkDeviceSize> mappedBytes{0};
+};
+
+/** Tile size in bytes of sparse images. Vulkan's standard block shapes are those of 64 KiB. */
+static constexpr VkDeviceSize kMVKSparseTileBytes = 64 * 1024;
+
 struct MVKLiveResourceSet {
 	bool enabled;
 	MVKLiveList textures;
@@ -647,6 +667,9 @@ public:
 
 	/** Returns the list of live resources. */
 	MVKLiveResourceSet& getLiveResources() { return _liveResources; }
+
+	/** Returns a sparse heap with room for the tiles of a new sparse image, or nullptr. */
+	MVKSparseHeap* getSparseHeap();
 
     /** Returns the common resource factory for creating command resources. */
     MVKCommandResourceFactory* getCommandResourceFactory() { return _commandResourceFactory; }
@@ -1020,6 +1043,7 @@ protected:
 	MVKSmallVector<std::pair<MVKTimelineSemaphore*, uint64_t>> _awaitingTimelineSem4s;
 	MVKSmallVector<MVKVisibilityBuffer> _visibilityBuffers;
 	MVKLiveResourceSet _liveResources;
+	MVKSmallVector<MVKSparseHeap*, 4> _sparseHeaps;
 	std::mutex _rezLock;
 	std::mutex _sem4Lock;
     std::mutex _perfLock;

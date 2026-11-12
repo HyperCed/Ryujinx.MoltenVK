@@ -145,6 +145,19 @@ VkResult MVKQueue::submit(uint32_t submitCount, const S* pSubmits, VkFence fence
 template VkResult MVKQueue::submit(uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence, MVKCommandUse cmdUse);
 template VkResult MVKQueue::submit(uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence, MVKCommandUse cmdUse);
 
+VkResult MVKQueue::submitSparse(uint32_t bindInfoCount, const VkBindSparseInfo* pBindInfo, VkFence fence) {
+	if (bindInfoCount == 0 && fence) {
+		return submit(new MVKQueueCommandBufferSubmission(this, (VkSubmitInfo*)nullptr, fence, kMVKCommandUseQueueSubmit));
+	}
+	VkResult rslt = VK_SUCCESS;
+	for (uint32_t i = 0; i < bindInfoCount; i++) {
+		VkFence fenceOrNil = (i == (bindInfoCount - 1)) ? fence : VK_NULL_HANDLE; // last one gets the fence
+		VkResult subRslt = submit(new MVKQueueSparseBindSubmission(this, &pBindInfo[i], fenceOrNil));
+		if (rslt == VK_SUCCESS) { rslt = subRslt; }
+	}
+	return rslt;
+}
+
 VkResult MVKQueue::submit(const VkPresentInfoKHR* pPresentInfo) {
 	return submit(new MVKQueuePresentSurfaceSubmission(this, pPresentInfo));
 }
@@ -653,6 +666,60 @@ MVKQueueCommandBufferSubmission::~MVKQueueCommandBufferSubmission() {
 	if (_fence) { _fence->release(); }
 }
 
+
+// The semaphores and the fence are those of a submission without command buffers.
+// The result is valid on the calling thread until the next call.
+static const VkSubmitInfo* mvkSubmitInfoFromBindSparseInfo(const VkBindSparseInfo* pBindInfo) {
+	static thread_local VkSubmitInfo submitInfo;
+	submitInfo = {};
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.pNext = pBindInfo->pNext;
+	submitInfo.waitSemaphoreCount = pBindInfo->waitSemaphoreCount;
+	submitInfo.pWaitSemaphores = pBindInfo->pWaitSemaphores;
+	submitInfo.signalSemaphoreCount = pBindInfo->signalSemaphoreCount;
+	submitInfo.pSignalSemaphores = pBindInfo->pSignalSemaphores;
+	return &submitInfo;
+}
+
+MVKQueueSparseBindSubmission::MVKQueueSparseBindSubmission(MVKQueue* queue,
+														   const VkBindSparseInfo* pBindInfo,
+														   VkFence fence)
+	: MVKQueueCommandBufferSubmission(queue, mvkSubmitInfoFromBindSparseInfo(pBindInfo), fence, kMVKCommandUseQueueSubmit) {
+
+	if (pBindInfo->bufferBindCount) {
+		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueBindSparse(): Metal does not support sparse buffers."));
+	}
+	// The record of what each image maps is updated here, on the calling thread, so that
+	// a bind the heap has no room for is reported; the mappings are encoded with the queue.
+	for (uint32_t i = 0; i < pBindInfo->imageBindCount; i++) {
+		auto& imgBind = pBindInfo->pImageBinds[i];
+		setConfigurationResult(((MVKImage*)imgBind.image)->addSparseMappings(imgBind.bindCount, imgBind.pBinds, _mappings));
+	}
+	for (uint32_t i = 0; i < pBindInfo->imageOpaqueBindCount; i++) {
+		auto& imgBind = pBindInfo->pImageOpaqueBinds[i];
+		setConfigurationResult(((MVKImage*)imgBind.image)->addSparseMappings(imgBind.bindCount, imgBind.pBinds, _mappings));
+	}
+	for (auto& m : _mappings) { m.image->retain(); }
+}
+
+MVKQueueSparseBindSubmission::~MVKQueueSparseBindSubmission() {
+	for (auto& m : _mappings) { m.image->release(); }
+}
+
+void MVKQueueSparseBindSubmission::submitCommandBuffers() {
+	if (_mappings.empty()) { return; }
+	if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
+		id<MTLResourceStateCommandEncoder> mtlEnc = [getActiveMTLCommandBuffer() resourceStateCommandEncoder];
+		for (auto& m : _mappings) {
+			[mtlEnc updateTextureMapping: m.image->getMTLTexture(0)
+									mode: m.map ? MTLSparseTextureMappingModeMap : MTLSparseTextureMappingModeUnmap
+								  region: MTLRegionMake2D(m.tileX, m.tileY, m.tileWidth, m.tileHeight)
+								mipLevel: m.level
+								   slice: m.slice];
+		}
+		[mtlEnc endEncoding];
+	}
+}
 
 template <size_t N>
 void MVKQueueFullCommandBufferSubmission<N>::submitCommandBuffers() {

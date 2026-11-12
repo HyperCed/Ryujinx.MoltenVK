@@ -25,6 +25,7 @@
 #include <MoltenVKShaderConverter/SPIRVToMSLConverter.h>
 #include <unordered_map>
 #include <mutex>
+#include <unordered_set>
 
 #import <IOSurface/IOSurfaceRef.h>
 
@@ -94,6 +95,19 @@ protected:
     MVKSmallVector<MVKImageSubresource, 1> _subresources;
     HeapAllocation _heapAllocation;
 };
+
+
+#pragma mark -
+#pragma mark MVKSparseMapping
+
+/** One sparse tile region of an image to map or unmap, in tiles. */
+typedef struct MVKSparseMapping {
+	MVKImage* image;
+	uint32_t level;
+	uint32_t slice;
+	uint32_t tileX, tileY, tileWidth, tileHeight;
+	bool map;
+} MVKSparseMapping;
 
 
 #pragma mark -
@@ -250,6 +264,25 @@ public:
 	/** Binds this resource to the specified offset within the specified memory allocation. */
 	virtual VkResult bindDeviceMemory(MVKDeviceMemory* mvkMem, VkDeviceSize memOffset, uint8_t planeIndex);
 
+#pragma mark Sparse residency
+
+	/** Returns whether this image was created with sparse residency. */
+	bool getIsSparse() { return _isSparse; }
+
+	/** Populates the sparse memory requirements of this image. */
+	void getSparseMemoryRequirements(uint32_t* pCount, VkSparseImageMemoryRequirements* pReqs);
+
+	/**
+	 * Adds to mappings the tile mappings that the sparse binds ask for, and accounts for their
+	 * memory in the sparse heap. Fails, changing nothing, when the heap has no room for them.
+	 */
+	VkResult addSparseMappings(uint32_t bindCount, const VkSparseImageMemoryBind* pBinds,
+							   MVKSmallVector<MVKSparseMapping, 16>& mappings);
+
+	/** As above, for binds of the mip tail. */
+	VkResult addSparseMappings(uint32_t bindCount, const VkSparseMemoryBind* pBinds,
+							   MVKSmallVector<MVKSparseMapping, 16>& mappings);
+
 	/** Binds this resource to the specified offset within the specified memory allocation. */
 	virtual VkResult bindDeviceMemory2(const VkBindImageMemoryInfo* pBindInfo);
 
@@ -402,6 +435,17 @@ protected:
 	bool _isLinearForAtomics;
 	bool _is2DViewOn3DImageCompatible = false;
 	bool _isBlockTexelViewCompatible = false;
+
+	void initSparse();
+	VkResult commitSparseMappings(MVKSmallVector<MVKSparseMapping, 16>& newMappings,
+								  MVKSmallVector<MVKSparseMapping, 16>& mappings);
+
+	bool _isSparse = false;
+	MVKSparseHeap* _sparseHeap = nullptr;
+	VkExtent3D _sparseTileExtent = {};
+	uint32_t _sparseTailLevel = 0;			// First mip level in the tail, or _mipLevels if none.
+	VkDeviceSize _sparseTailBytes = 0;
+	std::unordered_set<uint64_t> _sparseMappedTiles;
 };
 
 

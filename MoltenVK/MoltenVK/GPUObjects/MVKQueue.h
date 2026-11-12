@@ -99,6 +99,9 @@ public:
 	/** Submits the specified presentation command to the queue. */
 	VkResult submit(const VkPresentInfoKHR* pPresentInfo);
 
+	/** Submits the sparse image binds to this queue. Buffer binds are not supported. */
+	VkResult submitSparse(uint32_t bindInfoCount, const VkBindSparseInfo* pBindInfo, VkFence fence);
+
 	/** Block the current thread until this queue is idle. */
 	VkResult waitIdle(MVKCommandUse cmdUse);
 
@@ -274,6 +277,21 @@ protected:
 	id<MTLCommandBuffer> _activeMTLCommandBuffer = nil;
 	MVKCommandUse _commandUse = kMVKCommandUseNone;
 	bool _emulatedWaitDone = false;		//Used to track if we've already waited for emulated semaphores.
+};
+
+
+/** Maps and unmaps the tiles of sparse images, in order with the command buffers of the queue. */
+class MVKQueueSparseBindSubmission : public MVKQueueCommandBufferSubmission {
+
+public:
+	MVKQueueSparseBindSubmission(MVKQueue* queue, const VkBindSparseInfo* pBindInfo, VkFence fence);
+
+	~MVKQueueSparseBindSubmission() override;
+
+protected:
+	void submitCommandBuffers() override;
+
+	MVKSmallVector<MVKSparseMapping, 16> _mappings;
 };
 
 

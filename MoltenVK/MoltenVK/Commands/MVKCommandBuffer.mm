@@ -784,6 +784,11 @@ void MVKCommandEncoder::finalizeDrawState(MVKGraphicsStage stage) {
 	}
 }
 
+void MVKCommandEncoder::finalizeMeshDrawState() {
+	prepareDraw<true>();
+	_occlusionQueryState.encode(_mtlRenderEncoder, this);
+}
+
 // Clears the render area of the framebuffer attachments.
 void MVKCommandEncoder::clearRenderArea(MVKCommandUse cmdUse) {
 
@@ -1151,6 +1156,7 @@ MVKCommandEncoder::MVKCommandEncoder(MVKCommandBuffer* cmdBuffer, MVKPrefillMeta
 	_pEncodingContext = nullptr;
 	_stageCountersMTLFence = nil;
 	_flushCount = 0;
+	_state.mtlShared()._useResource.vertexStages = _device->getMTLVertexStages();
 }
 
 MVKCommandEncoder::~MVKCommandEncoder() {

@@ -804,7 +804,9 @@ MVK_PUBLIC_SYMBOL MTLRenderStages mvkMTLRenderStagesFromVkPipelineStageFlags(VkP
 																	 VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
 																	 VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
 																	 VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
-																	 VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT));
+																	 VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
+																	 VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT |
+																	 VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT));
 		return placeAfterVertex ? MTLRenderStageVertex : MTLRenderStageFragment;
 	}
 }

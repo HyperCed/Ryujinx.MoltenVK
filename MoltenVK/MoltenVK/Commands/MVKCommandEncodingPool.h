@@ -121,6 +121,8 @@ public:
 	/** Returns a MTLComputePipelineState for converting the contents of an indirect buffer. */
 	id<MTLComputePipelineState> getCmdDrawIndirectConvertBuffersMTLComputePipelineState(bool indexed);
 
+	/** returns a MTLComputePipelineState for emulating indirect mesh draw count */
+
 	/** Returns a MTLComputePipelineState for converting an indirect buffer for use in a tessellated draw. */
 	id<MTLComputePipelineState> getCmdDrawIndirectTessConvertBuffersMTLComputePipelineState(bool indexed);
 

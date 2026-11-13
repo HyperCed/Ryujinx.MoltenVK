@@ -594,6 +594,7 @@ id<MTLFunction> MVKCommandResourceFactory::newFunctionNamed(const char* funcName
 	uint64_t startTime = getPerformanceTimestamp();
 	NSString* nsFuncName = [[NSString alloc] initWithUTF8String: funcName];		// temp retained
 	id<MTLFunction> mtlFunc = [_mtlLibrary newFunctionWithName: nsFuncName];	// retained
+	if ( !mtlFunc ) { mtlFunc = [getMeshMTLLibrary() newFunctionWithName: nsFuncName]; }	// retained
 	[nsFuncName release];														// temp release
 	addPerformanceInterval(getPerformanceStats().shaderCompilation.functionRetrieval, startTime);
 	return mtlFunc;
@@ -670,6 +671,36 @@ void MVKCommandResourceFactory::initMTLLibrary() {
     }
 }
 
+// Functions of mesh pipelines, built with MSL 3.0 on their own: this build keeps the other
+// command shaders at MSL 2.4.
+static NSString* _MVKMeshCmdShaderSource = @R"(
+#include <metal_stdlib>
+using namespace metal;
+
+// Launches the mesh grid read from a buffer, for GPUs without indirect mesh draws.
+[[object]] void objCmdDrawMeshTasks(const device MTLDispatchThreadgroupsIndirectArguments& args [[buffer(0)]],
+                                    mesh_grid_properties grid) {
+	grid.set_threadgroups_per_grid(uint3(args.threadgroupsPerGrid[0], args.threadgroupsPerGrid[1], args.threadgroupsPerGrid[2]));
+}
+
+// Rasterizing mesh pipelines need a fragment function, even when Vulkan has none.
+fragment void fragCmdNone() {}
+)";
+
+id<MTLLibrary> MVKCommandResourceFactory::getMeshMTLLibrary() {
+	lock_guard<mutex> lock(_meshLibraryLock);
+	if ( !_meshMTLLibrary ) {
+		@autoreleasepool {
+			NSError* err = nil;
+			MTLCompileOptions* options = getDevice()->getMTLCompileOptions();
+			options.languageVersion = std::max(options.languageVersion, MTLLanguageVersion3_0);
+			_meshMTLLibrary = [getMTLDevice() newLibraryWithSource: _MVKMeshCmdShaderSource options: options error: &err];	// retained
+			if (err) { MVKLogError("Could not compile the mesh command shaders (Error code %li):\n%s", (long)err.code, err.localizedDescription.UTF8String); }
+		}
+	}
+	return _meshMTLLibrary;
+}
+
 // Initializes the empty device memory used to back temporary VkImages.
 void MVKCommandResourceFactory::initImageDeviceMemory() {
 	VkMemoryAllocateInfo allocInfo = {
@@ -682,6 +713,7 @@ void MVKCommandResourceFactory::initImageDeviceMemory() {
 }
 
 MVKCommandResourceFactory::~MVKCommandResourceFactory() {
+	[_meshMTLLibrary release];
 	[_mtlLibrary release];
 	_mtlLibrary = nil;
 	if (_transferImageMemory) { _transferImageMemory->destroy(); }

@@ -1185,3 +1185,93 @@ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKI
     }
 }
 
+
+
+#pragma mark -
+#pragma mark MVKCmdDrawMeshTasks
+
+VkResult MVKCmdDrawMeshTasks::setContent(MVKCommandBuffer* cmdBuff,
+										 uint32_t groupCountX,
+										 uint32_t groupCountY,
+										 uint32_t groupCountZ) {
+	_groupCount = MTLSizeMake(groupCountX, groupCountY, groupCountZ);
+	return VK_SUCCESS;
+}
+
+void MVKCmdDrawMeshTasks::encode(MVKCommandEncoder* cmdEncoder) {
+	if ( !(_groupCount.width && _groupCount.height && _groupCount.depth) ) { return; }
+
+	cmdEncoder->restartMetalRenderPassIfNeeded();
+	cmdEncoder->finalizeMeshDrawState();
+	auto* pipeline = cmdEncoder->getGraphicsPipeline();
+	if ( !pipeline->hasValidMTLPipelineStates() ) { return; }
+
+	MTLSize groupCount = _groupCount;
+	if (pipeline->hasMeshGridObject()) {
+		uint32_t grid[] = { (uint32_t)groupCount.width, (uint32_t)groupCount.height, (uint32_t)groupCount.depth };
+		cmdEncoder->getMtlGraphics().bindObjectBytes(cmdEncoder->_mtlRenderEncoder, grid, sizeof(grid), 0);
+		groupCount = MTLSizeMake(1, 1, 1);
+	}
+	[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroups: groupCount
+							 threadsPerObjectThreadgroup: pipeline->getObjectThreadgroupSize()
+							   threadsPerMeshThreadgroup: pipeline->getMeshThreadgroupSize()];
+}
+
+
+#pragma mark -
+#pragma mark MVKCmdDrawMeshTasksIndirect
+
+VkResult MVKCmdDrawMeshTasksIndirect::setContent(MVKCommandBuffer* cmdBuff,
+												 VkBuffer buffer,
+												 VkDeviceSize offset,
+												 VkBuffer countBuffer,
+												 VkDeviceSize countBufferOffset,
+												 uint32_t drawCount,
+												 uint32_t stride) {
+	MVKBuffer* mvkBuffer = (MVKBuffer*)buffer;
+	_mtlIndirectBuffer = mvkBuffer->getMTLBuffer();
+	_mtlIndirectBufferOffset = mvkBuffer->getMTLBufferOffset() + offset;
+	_mtlIndirectBufferStride = stride;
+	_drawCount = drawCount;
+	MVKBuffer* mvkCountBuffer = (MVKBuffer*)countBuffer;
+	_mtlCountBuffer = mvkCountBuffer ? mvkCountBuffer->getMTLBuffer() : nil;
+	_mtlCountBufferOffset = mvkCountBuffer ? mvkCountBuffer->getMTLBufferOffset() + countBufferOffset : 0;
+	return VK_SUCCESS;
+}
+
+void MVKCmdDrawMeshTasksIndirect::encode(MVKCommandEncoder* cmdEncoder) {
+	if ( !_drawCount ) { return; }
+
+	cmdEncoder->restartMetalRenderPassIfNeeded();
+	id<MTLBuffer> indirectBuffer = _mtlIndirectBuffer;
+	VkDeviceSize indirectBufferOffset = _mtlIndirectBufferOffset;
+	uint32_t indirectBufferStride = _mtlIndirectBufferStride;
+	if (_mtlCountBuffer) {
+		// This MoltenVK has no indirect count conversion (vkCmdDrawMeshTasksIndirectCountEXT).
+		MVKLogError("vkCmdDrawMeshTasksIndirectCountEXT() is not supported; the draw is skipped.");
+		return;
+	}
+
+	cmdEncoder->finalizeMeshDrawState();
+	auto* pipeline = cmdEncoder->getGraphicsPipeline();
+	if ( !pipeline->hasValidMTLPipelineStates() ) { return; }
+
+	if ( !pipeline->hasMeshGridObject() && !pipeline->getPhysicalDevice()->getMTLDeviceCapabilities().supportsApple9 ) {
+		// Apple7/8 have no indirect mesh draws, and the task shader holds the object stage.
+		MVKLogError("vkCmdDrawMeshTasksIndirectEXT() with a task shader needs an Apple9 GPU; the draw is skipped.");
+		return;
+	}
+	for (uint32_t drawIdx = 0; drawIdx < _drawCount; drawIdx++) {
+		if (pipeline->hasMeshGridObject()) {
+			cmdEncoder->getMtlGraphics().bindObjectBuffer(cmdEncoder->_mtlRenderEncoder, indirectBuffer, indirectBufferOffset + drawIdx * indirectBufferStride, 0);
+			[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroups: MTLSizeMake(1, 1, 1)
+									 threadsPerObjectThreadgroup: pipeline->getObjectThreadgroupSize()
+									   threadsPerMeshThreadgroup: pipeline->getMeshThreadgroupSize()];
+			continue;
+		}
+		[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroupsWithIndirectBuffer: indirectBuffer
+														 indirectBufferOffset: indirectBufferOffset + drawIdx * indirectBufferStride
+												  threadsPerObjectThreadgroup: pipeline->getObjectThreadgroupSize()
+													threadsPerMeshThreadgroup: pipeline->getMeshThreadgroupSize()];
+	}
+}

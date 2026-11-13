@@ -356,6 +356,14 @@ public:
 	id<MTLComputePipelineState> newCmdDrawIndirectConvertBuffersMTLComputePipelineState(bool indexed,
 																						MVKVulkanAPIDeviceObject* owner);
 
+	/** returns a new MTLComputePipelineState for emulating indirect mesh draw count */
+
+	/** returns a new (retained) MTLFunction from the command shader library */
+	id<MTLFunction> newFunctionNamed(const char* funcName);
+
+	/** The library of the mesh pipeline functions, built with MSL 3.0 on first use. */
+	id<MTLLibrary> getMeshMTLLibrary();
+
 	/** Returns a new MTLComputePipelineState for converting an indirect buffer for use in a tessellated draw. */
 	id<MTLComputePipelineState> newCmdDrawIndirectTessConvertBuffersMTLComputePipelineState(bool indexed,
 																							MVKVulkanAPIDeviceObject* owner);
@@ -384,7 +392,6 @@ protected:
 	id<MTLFunction> newClearVertFunction(MVKRPSKeyClearAtt& attKey);
 	id<MTLFunction> newClearFragFunction(MVKRPSKeyClearAtt& attKey);
 	NSString* getMTLFormatTypeString(MTLPixelFormat mtlPixFmt);
-    id<MTLFunction> newFunctionNamed(const char* funcName);
 	id<MTLFunction> newMTLFunction(NSString* mslSrcCode, NSString* funcName);
 	id<MTLRenderPipelineState> newMTLRenderPipelineState(MTLRenderPipelineDescriptor* plDesc,
 														 MVKVulkanAPIDeviceObject* owner);
@@ -392,6 +399,8 @@ protected:
 														   MVKVulkanAPIDeviceObject* owner);
 
 	id<MTLLibrary> _mtlLibrary;
+	id<MTLLibrary> _meshMTLLibrary = nil;
+	std::mutex _meshLibraryLock;
 	MVKDeviceMemory* _transferImageMemory;
 };
 

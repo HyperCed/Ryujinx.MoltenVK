@@ -565,6 +565,11 @@ id<MTLLibrary> MVKShaderLibraryCompiler::newMTLLibrary(NSString* mslSourceCode,
 			@autoreleasepool {
 				auto mtlCompileOptions = getDevice()->getMTLCompileOptions(shaderConversionResults.entryPoint.fpFastMathFlags,
 																		   shaderConversionResults.isPositionInvariant);
+				// Object and mesh functions need MSL 3.0, even where this build keeps the rest at 2.4.
+				if (mtlCompileOptions.languageVersion < MTLLanguageVersion3_0 &&
+					([mslSourceCode containsString: @"[[mesh]]"] || [mslSourceCode containsString: @"[[object]]"])) {
+					mtlCompileOptions.languageVersion = MTLLanguageVersion3_0;
+				}
 				if (!specializationMacroDef.empty()) {
 					size_t macro_count = specializationMacroDef.size();
 					NSString *macro_names[macro_count];

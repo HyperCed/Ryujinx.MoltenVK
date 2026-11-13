@@ -418,7 +418,7 @@ public:
 
 	/**
 	 * Size of the Metal sparse heaps that back sparse images, or zero if they are not supported.
-	 * Set by MVK_CONFIG_SPARSE_HEAP_SIZE_MB (default 2048, 0 disables sparse images).
+	 * Set by MVK_CONFIG_SPARSE_HEAP_SIZE_MB (default 3072, 0 disables sparse images).
 	 */
 	VkDeviceSize getSparseHeapSize();
 
@@ -990,6 +990,11 @@ public:
     static inline MVKDevice* getMVKDevice(VkDevice vkDevice) {
         return (MVKDevice*)getDispatchableObject(vkDevice);
     }
+
+	/** returns the Metal render stages that run Vulkan pre-rasterization shaders */
+	MTLRenderStages getMTLVertexStages() {
+		return _enabledMeshShaderFeatures.meshShader ? MTLRenderStageVertex | MTLRenderStageObject | MTLRenderStageMesh : MTLRenderStageVertex;
+	}
 
 protected:
 	friend class MVKDeviceTrackingMixin;

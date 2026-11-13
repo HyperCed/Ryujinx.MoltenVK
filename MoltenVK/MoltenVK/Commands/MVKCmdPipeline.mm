@@ -120,6 +120,8 @@ void MVKCmdPipelineBarrier<N>::encode(MVKCommandEncoder* cmdEncoder) {
 		for (auto& b : _barriers) {
 			MTLRenderStages srcStages = mvkMTLRenderStagesFromVkPipelineStageFlags(b.srcStageMask, false);
 			MTLRenderStages dstStages = mvkMTLRenderStagesFromVkPipelineStageFlags(b.dstStageMask, true);
+			if (srcStages == MTLRenderStageVertex) { srcStages = cmdEncoder->getDevice()->getMTLVertexStages(); }
+			if (dstStages == MTLRenderStageVertex) { dstStages = cmdEncoder->getDevice()->getMTLVertexStages(); }
 			switch (b.type) {
 				case MVKPipelineBarrier::Memory: {
 					MTLBarrierScope scope = (mvkMTLBarrierScopeFromVkAccessFlags(b.srcAccessMask) |
@@ -175,6 +177,13 @@ void MVKCmdPipelineBarrier<N>::encode(MVKCommandEncoder* cmdEncoder) {
 			if (mvkIsAnyFlagEnabled(_dependencyFlags, VK_DEPENDENCY_BY_REGION_BIT) &&
 				mvkIsAnyFlagEnabled(b.dstAccessMask, VK_ACCESS_INPUT_ATTACHMENT_READ_BIT)) {
 
+				needsRenderpassRestart = true;
+				break;
+			}
+			// task and mesh stages of later draws can run before earlier shader writes land, and render passes have no barriers
+			if (cmdEncoder->getEnabledMeshShaderFeatures().meshShader &&
+				mvkIsAnyFlagEnabled(b.srcAccessMask, VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT) &&
+				mvkIsAnyFlagEnabled(mvkMTLRenderStagesFromVkPipelineStageFlags(b.dstStageMask, true), MTLRenderStageVertex | cmdEncoder->getDevice()->getMTLVertexStages())) {
 				needsRenderpassRestart = true;
 				break;
 			}

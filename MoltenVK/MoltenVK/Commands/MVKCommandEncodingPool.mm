@@ -235,6 +235,7 @@ void MVKCommandEncodingPool::destroyMetalResources() {
     _mtlDrawIndirectConvertBuffersComputePipelineState[0] = nil;
     _mtlDrawIndirectConvertBuffersComputePipelineState[1] = nil;
 
+
     [_mtlDrawIndirectTessConvertBuffersComputePipelineState[0] release];
     [_mtlDrawIndirectTessConvertBuffersComputePipelineState[1] release];
     _mtlDrawIndirectTessConvertBuffersComputePipelineState[0] = nil;

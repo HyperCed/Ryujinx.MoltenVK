@@ -17,6 +17,8 @@
  */
 
 #include "MVKShaderModule.h"
+#include <atomic>
+#include <regex>
 #include "MVKPipeline.h"
 #include "MVKFoundation.h"
 #include <sys/stat.h>
@@ -116,6 +118,7 @@ MVKMTLFunction MVKShaderLibrary::getMTLFunction(const VkSpecializationInfo* pSpe
 
 			uint64_t startTime = pShaderFeedback ? mvkGetTimestamp() : getPerformanceTimestamp();
 			id<MTLFunction> mtlFunc = [[lib newFunctionWithName: mtlFuncName] autorelease];
+			if (mtlFunc && lib.label) { mtlFunc.label = lib.label; }
 			addPerformanceInterval(getPerformanceStats().shaderCompilation.functionRetrieval, startTime);
 			if (pShaderFeedback) {
 				if (mtlFunc) {
@@ -225,8 +228,88 @@ MVKShaderLibrary::MVKShaderLibrary(MVKVulkanAPIDeviceObject* owner,
 	compileLibrary(msl, specializationMacroDef);
 }
 
-void MVKShaderLibrary::compileLibrary(const string& msl,
+// Experiment (MVK_MESH_THREAD_OUTPUTS=1): SPIRV-Cross stages a mesh function's outputs in threadgroup
+// memory, which an Apple GPU limits to 32 KiB. When thread i writes exactly the vertices and primitives
+// i, i + T, i + 2T... (T threads; the ones it then hands to the mesh), each thread can keep its own
+// N / T of them instead. Rewrites the staging arrays and their accesses that way.
+static string mvkMeshOutputsPerThread(const string& src) {
+	if (src.find("[[mesh]]") == string::npos) { return src; }
+	smatch m;
+	static const regex sizeRE("constant uint3 gl_WorkGroupSize[^=]*= uint3\\((\\d+)u(?:, (\\d+)u, (\\d+)u)?\\)");
+	if ( !regex_search(src, m, sizeRE) ) { return src; }
+	uint32_t threads = (uint32_t)stoul(m[1]);
+	threads = m[2].matched ? threads * (uint32_t)stoul(m[2]) * (uint32_t)stoul(m[3]) : threads * threads * threads;
+	if (threads < 2) { return src; }
+
+	// The staged outputs are the arrays the epilogue reads by spvVI and spvPI.
+	vector<string> names;
+	static const regex useRE("([A-Za-z_][A-Za-z0-9_]*)\\[sp(?:vVI|vPI)\\]");
+	for (sregex_iterator it(src.begin(), src.end(), useRE), end; it != end; ++it) {
+		string name = (*it)[1];
+		if (find(names.begin(), names.end(), name) == names.end()) { names.push_back(name); }
+	}
+	string msl = src;
+	const string threadsStr = to_string(threads) + "u";
+	for (const string& name : names) {
+		// Declarations and reference parameters.
+		const regex declRE("threadgroup spvUnsafeArray<([^,<>]+), (\\d+)>(&?) " + name + "\\b");
+		string out;
+		string::const_iterator pos = msl.cbegin();
+		for (sregex_iterator it(msl.cbegin(), msl.cend(), declRE), end; it != end; ++it) {
+			out.append(pos, (*it)[0].first);
+			const uint32_t count = ((uint32_t)stoul((*it)[2]) + threads - 1) / threads;
+			out += string((*it)[3].length() ? "thread " : "") + "spvUnsafeArray<" + (*it)[1].str() + ", " +
+				   to_string(count) + ">" + (*it)[3].str() + " " + name;
+			pos = (*it)[0].second;
+		}
+		out.append(pos, msl.cend());
+		msl.swap(out);
+
+		// Accesses: NAME[expr] -> NAME[(expr) / T], and the pointer casts SPIRV-Cross puts on them.
+		out.clear();
+		size_t at = 0;
+		const string key = name + "[";
+		while (true) {
+			size_t hit = msl.find(key, at);
+			if (hit == string::npos) { break; }
+			const char before = hit ? msl[hit - 1] : ' ';
+			if (isalnum((unsigned char)before) || before == '_' || before == '.') {
+				out.append(msl, at, hit + key.size() - at);
+				at = hit + key.size();
+				continue;
+			}
+			size_t open = hit + key.size(), close = open;
+			for (int depth = 1; close < msl.size(); ++close) {
+				if (msl[close] == '[') { ++depth; }
+				else if (msl[close] == ']' && --depth == 0) { break; }
+			}
+			string head = msl.substr(at, hit - at);
+			static const string cast = "(threadgroup ";
+			if (head.size() >= 3 && head.compare(head.size() - 3, 3, "*)&") == 0) {
+				size_t c = head.rfind(cast);
+				if (c != string::npos && head.find_first_of(";\n", c) == string::npos) {
+					head.replace(c, cast.size(), "(thread ");
+				}
+			}
+			out += head + key + "(" + msl.substr(open, close - open) + ") / " + threadsStr + "]";
+			at = close + 1;
+		}
+		out.append(msl, at, string::npos);
+		msl.swap(out);
+	}
+	return msl;
+}
+
+void MVKShaderLibrary::compileLibrary(const string& mslIn,
 									  const vector<pair<uint32_t, MVKShaderMacroValue> >* specializationMacroDef) {
+	static const bool meshThreadOutputs = getenv("MVK_MESH_THREAD_OUTPUTS") != nullptr;
+	string msl = meshThreadOutputs ? mvkMeshOutputsPerThread(mslIn) : mslIn;
+	// Experiment (MVK_NO_OPTNONE=1): let Metal optimize and inline SPIRV-Cross's NoContraction helpers.
+	static const bool noOptnone = getenv("MVK_NO_OPTNONE") != nullptr;
+	if (noOptnone) {
+		static const string attr = "[[clang::optnone]] ";
+		for (size_t pos = 0; (pos = msl.find(attr, pos)) != string::npos; ) { msl.erase(pos, attr.size()); }
+	}
 	MVKShaderLibraryCompiler* slc = new MVKShaderLibraryCompiler(_owner);
 	NSString* nsSrc = [[NSString alloc] initWithUTF8String: msl.c_str()];	// temp retained
 
@@ -570,6 +653,22 @@ id<MTLLibrary> MVKShaderLibraryCompiler::newMTLLibrary(NSString* mslSourceCode,
 					([mslSourceCode containsString: @"[[mesh]]"] || [mslSourceCode containsString: @"[[object]]"])) {
 					mtlCompileOptions.languageVersion = MTLLanguageVersion3_0;
 				}
+				// Experiment (MVK_NO_OPTNONE=2): shaders that lost their optnone helpers keep IEEE math instead.
+				if (const char* noOptnone = getenv("MVK_NO_OPTNONE")) {
+					if (noOptnone[0] == '2' && [mslSourceCode containsString: @" spvF"] &&
+						[mtlCompileOptions respondsToSelector: @selector(mathMode)]) {
+						mtlCompileOptions.mathMode = MTLMathModeSafe;
+						mtlCompileOptions.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+					}
+				}
+				// Experiment: MVK_DUMP_MESH_MSL=<dir> writes each object and mesh function's source there.
+				if (const char* dumpDir = getenv("MVK_DUMP_MESH_MSL")) {
+					if ([mslSourceCode containsString: @"[[mesh]]"] || [mslSourceCode containsString: @"[[object]]"]) {
+						static std::atomic<uint32_t> dumpCount{0};
+						NSString* path = [NSString stringWithFormat: @"%s/mesh-%03u.metal", dumpDir, dumpCount.fetch_add(1)];
+						[mslSourceCode writeToFile: path atomically: YES encoding: NSUTF8StringEncoding error: nil];
+					}
+				}
 				if (!specializationMacroDef.empty()) {
 					size_t macro_count = specializationMacroDef.size();
 					NSString *macro_names[macro_count];
@@ -593,6 +692,19 @@ id<MTLLibrary> MVKShaderLibraryCompiler::newMTLLibrary(NSString* mslSourceCode,
 			}
 		}
 	});
+
+	// Diagnostic: MVK_DUMP_COMPUTE_MSL=<dir> writes each compute function's source there as
+	// cs-<hash>.metal and labels its library, pipeline and dispatch encoders with that name.
+	if (const char* dumpDir = getenv("MVK_DUMP_COMPUTE_MSL")) {
+		if (_mtlLibrary && [mslSourceCode containsString: @"kernel void"]) {
+			uint64_t hash = 0xcbf29ce484222325ull;
+			for (const char* c = mslSourceCode.UTF8String; *c; c++) { hash = (hash ^ (uint8_t)*c) * 0x100000001b3ull; }
+			NSString* name = [NSString stringWithFormat: @"cs-%016llx", hash];
+			_mtlLibrary.label = name;
+			[mslSourceCode writeToFile: [NSString stringWithFormat: @"%s/%@.metal", dumpDir, name]
+							atomically: YES encoding: NSUTF8StringEncoding error: nil];
+		}
+	}
 
 	return [_mtlLibrary retain];
 }

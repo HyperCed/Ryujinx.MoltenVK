@@ -47,6 +47,12 @@ void MVKCmdDispatch::encode(MVKCommandEncoder* cmdEncoder) {
 	cmdEncoder->finalizeDispatchState();	// Ensure all updated state has been submitted to Metal
 	id<MTLComputeCommandEncoder> mtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch);
 	auto* pipeline = cmdEncoder->getComputePipeline();
+	static const bool labelDispatches = getenv("MVK_DUMP_COMPUTE_MSL") != nullptr;
+	if (labelDispatches) {
+		if (NSString* label = pipeline->getPipelineState().label) {
+			mtlEncoder.label = [NSString stringWithFormat: @"%@ g%ux%ux%u", label, _groupCountX, _groupCountY, _groupCountZ];
+		}
+	}
 	if (pipeline->allowsDispatchBase()) {
 		// We'll use the stage-input region to pass the base along to the shader.
 		// Hopefully Metal won't complain that we didn't set up a stage-input descriptor.
@@ -54,6 +60,9 @@ void MVKCmdDispatch::encode(MVKCommandEncoder* cmdEncoder) {
 	}
 	[mtlEncoder dispatchThreadgroups: mtlThreadgroupCount.size
 			   threadsPerThreadgroup: pipeline->getThreadgroupSize()];
+	// Diagnostic: MVK_SPLIT_COMPUTE gives each dispatch its own encoder, so a GPU trace times it alone.
+	static const bool splitDispatches = getenv("MVK_SPLIT_COMPUTE") != nullptr;
+	if (splitDispatches) { cmdEncoder->endCurrentMetalEncoding(); }
 }
 
 
@@ -70,8 +79,16 @@ VkResult MVKCmdDispatchIndirect::setContent(MVKCommandBuffer* cmdBuff, VkBuffer 
 
 void MVKCmdDispatchIndirect::encode(MVKCommandEncoder* cmdEncoder) {
     cmdEncoder->finalizeDispatchState();	// Ensure all updated state has been submitted to Metal
+	static const bool labelDispatches = getenv("MVK_DUMP_COMPUTE_MSL") != nullptr;
+	if (labelDispatches) {
+		if (NSString* label = cmdEncoder->getComputePipeline()->getPipelineState().label) {
+			cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch).label = label;
+		}
+	}
     [cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch) dispatchThreadgroupsWithIndirectBuffer: _mtlIndirectBuffer
 																				indirectBufferOffset: _mtlIndirectBufferOffset
 																			   threadsPerThreadgroup: cmdEncoder->getComputePipeline()->getThreadgroupSize()];
+	static const bool splitDispatches = getenv("MVK_SPLIT_COMPUTE") != nullptr;
+	if (splitDispatches) { cmdEncoder->endCurrentMetalEncoding(); }
 }
 
